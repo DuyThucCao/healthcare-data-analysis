@@ -205,15 +205,3 @@ The rendered HTML reports will appear in your working directory. Move the output
 | **Machine Learning** | `tidymodels`, logistic regression, random forest (`ranger`), cross-validation, ROC-AUC, SMOTE |
 | **Reporting** | R Markdown, parameterized notebooks, `knitr`, HTML output |
 | **Best Practices** | De-identification, data quality documentation, reproducible pipelines |
-
----
-
-## Contact
-
-**Thuc Cao**
-- GitHub: [@DuyThucCao](https://github.com/DuyThucCao)
-- Email: duythuccao@outlook.com
-
----
-
-*This project is part of a data science portfolio. Dataset is synthetic and for educational use only.*
