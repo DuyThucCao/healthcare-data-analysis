@@ -1,0 +1,500 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Healthcare Data Analysis | Thuc Cao</title>
+  <meta name="description" content="End-to-end R project: EDA, interactive visualization, and ML pipeline for healthcare utilization and billing data.">
+  <meta name="author" content="Thuc Cao">
+
+  <!-- Open Graph (for LinkedIn / social sharing) -->
+  <meta property="og:title" content="Healthcare Utilization & Billing Analysis" />
+  <meta property="og:description" content="EDA + Predictive Modeling in R | tidymodels | plotly | 55K patient encounters" />
+  <meta property="og:type" content="website" />
+
+  <style>
+    /* ── Design tokens ──────────────────────────────────────────────────── */
+    :root {
+      --blue-dark:   #1a3c6b;
+      --blue:        #2563eb;
+      --blue-light:  #dbeafe;
+      --teal:        #0891b2;
+      --orange:      #ea580c;
+      --green:       #16a34a;
+      --slate-50:    #f8fafc;
+      --slate-100:   #f1f5f9;
+      --slate-200:   #e2e8f0;
+      --slate-600:   #475569;
+      --slate-800:   #1e293b;
+      --white:       #ffffff;
+      --radius:      10px;
+      --shadow:      0 4px 24px rgba(0,0,0,0.08);
+      --font-sans:   'Segoe UI', system-ui, -apple-system, sans-serif;
+      --font-mono:   'Consolas', 'Courier New', monospace;
+    }
+
+    /* ── Reset & Base ───────────────────────────────────────────────────── */
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    html { scroll-behavior: smooth; }
+    body {
+      font-family: var(--font-sans);
+      background: var(--slate-50);
+      color: var(--slate-800);
+      line-height: 1.65;
+    }
+    a { color: var(--blue); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+
+    /* ── Hero ───────────────────────────────────────────────────────────── */
+    .hero {
+      background: linear-gradient(135deg, var(--blue-dark) 0%, #0f4c81 50%, var(--teal) 100%);
+      color: var(--white);
+      padding: 80px 24px 64px;
+      text-align: center;
+      position: relative;
+      overflow: hidden;
+    }
+    .hero::before {
+      content: "";
+      position: absolute; inset: 0;
+      background: url("data:image/svg+xml,%3Csvg width='60' height='60' viewBox='0 0 60 60' xmlns='http://www.w3.org/2000/svg'%3E%3Cg fill='none' fill-rule='evenodd'%3E%3Cg fill='%23ffffff' fill-opacity='0.03'%3E%3Cpath d='M36 34v-4h-2v4h-4v2h4v4h2v-4h4v-2h-4zm0-30V0h-2v4h-4v2h4v4h2V6h4V4h-4zM6 34v-4H4v4H0v2h4v4h2v-4h4v-2H6zM6 4V0H4v4H0v2h4v4h2V6h4V4H6z'/%3E%3C/g%3E%3C/g%3E%3C/svg%3E");
+    }
+    .hero-badge {
+      display: inline-block;
+      background: rgba(255,255,255,0.15);
+      border: 1px solid rgba(255,255,255,0.3);
+      border-radius: 999px;
+      padding: 4px 14px;
+      font-size: 13px;
+      font-weight: 600;
+      letter-spacing: 0.05em;
+      text-transform: uppercase;
+      margin-bottom: 20px;
+    }
+    .hero h1 {
+      font-size: clamp(28px, 5vw, 52px);
+      font-weight: 800;
+      line-height: 1.15;
+      margin-bottom: 16px;
+      letter-spacing: -0.02em;
+    }
+    .hero p {
+      font-size: clamp(15px, 2vw, 19px);
+      opacity: 0.88;
+      max-width: 620px;
+      margin: 0 auto 32px;
+    }
+    .hero-actions { display: flex; gap: 12px; justify-content: center; flex-wrap: wrap; }
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 12px 24px;
+      border-radius: var(--radius);
+      font-weight: 600;
+      font-size: 15px;
+      cursor: pointer;
+      transition: all 0.2s;
+    }
+    .btn-primary {
+      background: var(--white);
+      color: var(--blue-dark);
+    }
+    .btn-primary:hover { background: #f0f7ff; text-decoration: none; transform: translateY(-1px); }
+    .btn-outline {
+      background: transparent;
+      color: var(--white);
+      border: 2px solid rgba(255,255,255,0.6);
+    }
+    .btn-outline:hover { background: rgba(255,255,255,0.1); text-decoration: none; }
+
+    /* ── Stats bar ──────────────────────────────────────────────────────── */
+    .stats-bar {
+      background: var(--white);
+      border-bottom: 1px solid var(--slate-200);
+      display: flex;
+      justify-content: center;
+      flex-wrap: wrap;
+      gap: 0;
+    }
+    .stat-item {
+      padding: 22px 36px;
+      text-align: center;
+      border-right: 1px solid var(--slate-200);
+    }
+    .stat-item:last-child { border-right: none; }
+    .stat-value {
+      font-size: 26px;
+      font-weight: 800;
+      color: var(--blue-dark);
+      display: block;
+    }
+    .stat-label {
+      font-size: 12px;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      color: var(--slate-600);
+      font-weight: 600;
+    }
+
+    /* ── Main content ───────────────────────────────────────────────────── */
+    .container { max-width: 1100px; margin: 0 auto; padding: 0 24px; }
+
+    section { padding: 60px 0; }
+    section + section { border-top: 1px solid var(--slate-200); }
+
+    h2 {
+      font-size: 28px;
+      font-weight: 800;
+      color: var(--blue-dark);
+      margin-bottom: 8px;
+      letter-spacing: -0.02em;
+    }
+    .section-sub {
+      color: var(--slate-600);
+      margin-bottom: 32px;
+      font-size: 16px;
+    }
+
+    /* ── Card grid ──────────────────────────────────────────────────────── */
+    .card-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+      gap: 20px;
+    }
+    .card {
+      background: var(--white);
+      border: 1px solid var(--slate-200);
+      border-radius: var(--radius);
+      padding: 28px;
+      box-shadow: var(--shadow);
+      transition: transform 0.2s, box-shadow 0.2s;
+    }
+    .card:hover { transform: translateY(-3px); box-shadow: 0 8px 32px rgba(0,0,0,0.12); }
+    .card-icon {
+      font-size: 28px;
+      margin-bottom: 14px;
+    }
+    .card h3 {
+      font-size: 17px;
+      font-weight: 700;
+      margin-bottom: 10px;
+      color: var(--slate-800);
+    }
+    .card p { font-size: 14px; color: var(--slate-600); line-height: 1.6; }
+
+    /* ── Finding cards ──────────────────────────────────────────────────── */
+    .finding-card {
+      background: var(--white);
+      border-left: 4px solid var(--blue);
+      border-radius: 0 var(--radius) var(--radius) 0;
+      padding: 20px 24px;
+      box-shadow: var(--shadow);
+      margin-bottom: 16px;
+    }
+    .finding-card.orange { border-left-color: var(--orange); }
+    .finding-card.green  { border-left-color: var(--green); }
+    .finding-card.teal   { border-left-color: var(--teal); }
+    .finding-label {
+      font-size: 11px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: var(--slate-600);
+      margin-bottom: 6px;
+    }
+    .finding-card p { font-size: 15px; color: var(--slate-800); }
+    .finding-card strong { color: var(--blue-dark); }
+
+    /* ── ML model table ─────────────────────────────────────────────────── */
+    .model-table {
+      width: 100%;
+      border-collapse: collapse;
+      background: var(--white);
+      border-radius: var(--radius);
+      overflow: hidden;
+      box-shadow: var(--shadow);
+      font-size: 15px;
+    }
+    .model-table th {
+      background: var(--blue-dark);
+      color: var(--white);
+      font-weight: 600;
+      padding: 14px 18px;
+      text-align: left;
+    }
+    .model-table td { padding: 14px 18px; border-bottom: 1px solid var(--slate-200); }
+    .model-table tr:last-child td { border-bottom: none; }
+    .model-table tr:hover td { background: var(--slate-100); }
+    .badge-good { background: #dcfce7; color: #166534; border-radius: 4px; padding: 2px 8px; font-size: 12px; font-weight: 700; }
+    .badge-neutral { background: #fef9c3; color: #854d0e; border-radius: 4px; padding: 2px 8px; font-size: 12px; font-weight: 700; }
+
+    /* ── Tech stack pills ───────────────────────────────────────────────── */
+    .pill-group { display: flex; flex-wrap: wrap; gap: 10px; }
+    .pill {
+      background: var(--blue-light);
+      color: var(--blue-dark);
+      border-radius: 999px;
+      padding: 6px 16px;
+      font-size: 13px;
+      font-weight: 600;
+      border: 1px solid #bfdbfe;
+    }
+    .pill.orange { background: #ffedd5; color: #7c2d12; border-color: #fed7aa; }
+    .pill.green  { background: #dcfce7; color: #14532d; border-color: #bbf7d0; }
+    .pill.slate  { background: var(--slate-100); color: var(--slate-800); border-color: var(--slate-200); }
+
+    /* ── Code block ─────────────────────────────────────────────────────── */
+    .code-block {
+      background: var(--slate-800);
+      color: #93c5fd;
+      border-radius: var(--radius);
+      padding: 20px 24px;
+      font-family: var(--font-mono);
+      font-size: 13px;
+      line-height: 1.7;
+      overflow-x: auto;
+    }
+    .code-block .comment { color: #64748b; }
+    .code-block .keyword { color: #a78bfa; }
+    .code-block .string  { color: #86efac; }
+
+    /* ── Footer ─────────────────────────────────────────────────────────── */
+    footer {
+      background: var(--slate-800);
+      color: rgba(255,255,255,0.7);
+      text-align: center;
+      padding: 36px 24px;
+      font-size: 14px;
+    }
+    footer a { color: #93c5fd; }
+
+    @media (max-width: 600px) {
+      .stat-item { padding: 18px 20px; }
+      .stat-value { font-size: 22px; }
+      section { padding: 40px 0; }
+    }
+  </style>
+</head>
+
+<body>
+
+<!-- ── Hero ──────────────────────────────────────────────────────────────── -->
+<section class="hero">
+  <div class="hero-badge">Portfolio Project &middot; R &middot; Healthcare Analytics</div>
+  <h1>Healthcare Utilization<br>&amp; Billing Analysis</h1>
+  <p>End-to-end data science project: exploratory analysis, interactive visualization, and a supervised ML pipeline predicting patient test outcomes across 55,000+ encounters.</p>
+  <div class="hero-actions">
+    <a href="report.html" class="btn btn-primary">
+      ▶ View Interactive Report
+    </a>
+    <a href="https://github.com/DuyThucCao/healthcare-data-analysis" class="btn btn-outline" target="_blank" rel="noopener">
+      ⭐ GitHub Repository
+    </a>
+  </div>
+</section>
+
+<!-- ── Stats bar ─────────────────────────────────────────────────────────── -->
+<div class="stats-bar">
+  <div class="stat-item">
+    <span class="stat-value">55K+</span>
+    <span class="stat-label">Patient Encounters</span>
+  </div>
+  <div class="stat-item">
+    <span class="stat-value">6</span>
+    <span class="stat-label">Medical Conditions</span>
+  </div>
+  <div class="stat-item">
+    <span class="stat-value">2019–2024</span>
+    <span class="stat-label">Date Coverage</span>
+  </div>
+  <div class="stat-item">
+    <span class="stat-value">2</span>
+    <span class="stat-label">ML Models Compared</span>
+  </div>
+  <div class="stat-item">
+    <span class="stat-value">5-Fold</span>
+    <span class="stat-label">Cross-Validation</span>
+  </div>
+</div>
+
+<!-- ── Main ──────────────────────────────────────────────────────────────── -->
+<main>
+
+<!-- Overview ────────────────────────────────────────────────────────────── -->
+<section>
+  <div class="container">
+    <h2>Project Overview</h2>
+    <p class="section-sub">A two-part analysis combining rigorous EDA with a production-style ML pipeline.</p>
+    <div class="card-grid">
+      <div class="card">
+        <div class="card-icon">🔍</div>
+        <h3>Exploratory Analysis</h3>
+        <p>Data cleaning, quality documentation, feature engineering, and interactive visualizations (plotly) across billing, demographics, conditions, and utilization patterns. Statistical tests: chi-square, Pearson correlation, multivariable regression.</p>
+      </div>
+      <div class="card">
+        <div class="card-icon">🤖</div>
+        <h3>Machine Learning Pipeline</h3>
+        <p>Binary classification (Abnormal test result) using <code>tidymodels</code>. Logistic Regression vs. Random Forest with SMOTE resampling, hyperparameter tuning, ROC-AUC evaluation, and feature importance via <code>vip</code>.</p>
+      </div>
+      <div class="card">
+        <div class="card-icon">🔐</div>
+        <h3>Privacy-First Practice</h3>
+        <p>Even on synthetic data, direct patient identifiers (name, doctor, hospital, room) are excluded from all preview tables and model inputs — modeling professional healthcare data handling standards.</p>
+      </div>
+      <div class="card">
+        <div class="card-icon">📋</div>
+        <h3>Reproducible Workflow</h3>
+        <p>Fully documented R Markdown notebooks, version-controlled data, and a step-by-step reproduction guide. Anyone can re-run the analysis from source in minutes.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- Key Findings ─────────────────────────────────────────────────────────── -->
+<section>
+  <div class="container">
+    <h2>Key Findings</h2>
+    <p class="section-sub">Selected insights from the exploratory analysis.</p>
+
+    <div class="finding-card">
+      <div class="finding-label">💵 Billing</div>
+      <p>Median billing is <strong>~$25,000</strong> per encounter, right-skewed with a meaningful tail of high-cost cases. Emergency admissions drive higher median billing across nearly every condition.</p>
+    </div>
+    <div class="finding-card orange">
+      <div class="finding-label">🏥 Conditions</div>
+      <p><strong>Arthritis, Cancer, and Obesity</strong> have the highest median billing. Diabetes and Hypertension show the highest rates of Abnormal test results — a signal for care pathway prioritization.</p>
+    </div>
+    <div class="finding-card green">
+      <div class="finding-label">📊 Statistical Tests</div>
+      <p>Chi-square confirms <strong>admission type mix differs significantly by condition</strong> (p &lt; 0.001). Age has a weak positive correlation with billing (r ≈ 0.01) — condition and admission type matter more.</p>
+    </div>
+    <div class="finding-card teal">
+      <div class="finding-label">📅 Utilization</div>
+      <p>Weekday admissions are nearly <strong>uniformly distributed</strong>, suggesting this dataset captures a general inpatient population rather than a primarily elective-surgery facility.</p>
+    </div>
+  </div>
+</section>
+
+<!-- ML Results ──────────────────────────────────────────────────────────── -->
+<section>
+  <div class="container">
+    <h2>Machine Learning Results</h2>
+    <p class="section-sub">5-fold cross-validated performance on the binary classification task (Abnormal vs. Other test result).</p>
+
+    <table class="model-table">
+      <thead>
+        <tr>
+          <th>Model</th>
+          <th>ROC-AUC (CV)</th>
+          <th>Accuracy</th>
+          <th>F1 Score</th>
+          <th>Notes</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><strong>Logistic Regression</strong><br><small>glmnet, L1/L2 tuned</small></td>
+          <td><span class="badge-neutral">~0.50</span></td>
+          <td>~67%</td>
+          <td>~0.50</td>
+          <td>Interpretable baseline</td>
+        </tr>
+        <tr>
+          <td><strong>Random Forest</strong><br><small>ranger, mtry + min_n tuned</small></td>
+          <td><span class="badge-neutral">~0.52</span></td>
+          <td>~67%</td>
+          <td>~0.51</td>
+          <td>Best model, captures non-linear structure</td>
+        </tr>
+      </tbody>
+    </table>
+
+    <div class="finding-card" style="margin-top: 20px;">
+      <div class="finding-label">🧠 Interpretation</div>
+      <p>The near-chance AUC is an <strong>honest and important finding</strong>. Administrative features (demographics, condition, insurance) have weak predictive signal for test outcomes in this dataset. This demonstrates the ability to correctly diagnose and communicate a null result — a critical skill in applied data science. Real-world improvement would require clinical variables (vitals, labs, procedure codes).</p>
+    </div>
+  </div>
+</section>
+
+<!-- Tech Stack ──────────────────────────────────────────────────────────── -->
+<section>
+  <div class="container">
+    <h2>Tech Stack</h2>
+    <p class="section-sub">Libraries and methods used across the project.</p>
+
+    <p style="font-weight:700; margin-bottom: 10px; color: var(--slate-600);">DATA WRANGLING</p>
+    <div class="pill-group" style="margin-bottom:20px">
+      <span class="pill">tidyverse</span>
+      <span class="pill">janitor</span>
+      <span class="pill">lubridate</span>
+      <span class="pill">forcats</span>
+      <span class="pill">dplyr</span>
+    </div>
+
+    <p style="font-weight:700; margin-bottom: 10px; color: var(--slate-600);">VISUALIZATION</p>
+    <div class="pill-group" style="margin-bottom:20px">
+      <span class="pill orange">ggplot2</span>
+      <span class="pill orange">plotly</span>
+      <span class="pill orange">DT</span>
+      <span class="pill orange">scales</span>
+    </div>
+
+    <p style="font-weight:700; margin-bottom: 10px; color: var(--slate-600);">MACHINE LEARNING</p>
+    <div class="pill-group" style="margin-bottom:20px">
+      <span class="pill green">tidymodels</span>
+      <span class="pill green">ranger</span>
+      <span class="pill green">glmnet</span>
+      <span class="pill green">themis (SMOTE)</span>
+      <span class="pill green">vip</span>
+      <span class="pill green">yardstick</span>
+    </div>
+
+    <p style="font-weight:700; margin-bottom: 10px; color: var(--slate-600);">REPORTING</p>
+    <div class="pill-group">
+      <span class="pill slate">R Markdown</span>
+      <span class="pill slate">knitr</span>
+      <span class="pill slate">kableExtra</span>
+      <span class="pill slate">GitHub Pages</span>
+    </div>
+  </div>
+</section>
+
+<!-- Reproduce ────────────────────────────────────────────────────────────── -->
+<section>
+  <div class="container">
+    <h2>Reproduce This Analysis</h2>
+    <p class="section-sub">Clone the repo and re-run in RStudio in minutes.</p>
+
+    <div class="code-block">
+      <span class="comment"># 1. Clone the repository</span><br>
+      git clone https://github.com/DuyThucCao/healthcare-data-analysis.git<br><br>
+      <span class="comment"># 2. Install R dependencies</span><br>
+      <span class="keyword">install.packages</span>(<span class="string">c(</span><br>
+      &nbsp;&nbsp;<span class="string">"tidyverse"</span>, <span class="string">"tidymodels"</span>, <span class="string">"janitor"</span>, <span class="string">"lubridate"</span>,<br>
+      &nbsp;&nbsp;<span class="string">"plotly"</span>, <span class="string">"DT"</span>, <span class="string">"ranger"</span>, <span class="string">"themis"</span>,<br>
+      &nbsp;&nbsp;<span class="string">"vip"</span>, <span class="string">"knitr"</span>, <span class="string">"rmarkdown"</span>, <span class="string">"kableExtra"</span><br>
+      <span class="string">))</span><br><br>
+      <span class="comment"># 3. Knit the notebooks from RStudio or:</span><br>
+      <span class="keyword">rmarkdown</span>::render(<span class="string">"analysis/Healthcare-Data-Analysis.Rmd"</span>)<br>
+      <span class="keyword">rmarkdown</span>::render(<span class="string">"analysis/Healthcare-Data-Analysis-ML.Rmd"</span>)
+    </div>
+  </div>
+</section>
+
+</main>
+
+<!-- ── Footer ────────────────────────────────────────────────────────────── -->
+<footer>
+  <p>
+    Built by <strong style="color:white">Thuc Cao</strong> &middot;
+    <a href="https://github.com/DuyThucCao" target="_blank">GitHub</a> &middot;
+    <a href="mailto:duythuccao@outlook.com">duythuccao@outlook.com</a>
+  </p>
+  <p style="margin-top:8px; font-size:12px; opacity:0.6">
+    Dataset is synthetic and for educational purposes only. No real patient data.
+  </p>
+</footer>
+
+</body>
+</html>

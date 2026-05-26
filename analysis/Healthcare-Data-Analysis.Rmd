@@ -1,0 +1,624 @@
+---
+title: "Healthcare Utilization and Billing Analysis"
+author: "Thuc Cao"
+output:
+  html_notebook:
+    toc: true
+    toc_depth: 2
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+# Load packages for data preparation, visualization, interactive tables, and reporting.
+library(tidyverse)
+library(knitr)
+library(DT)
+library(plotly)
+library(janitor)
+library(lubridate)
+
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.width = 9,
+  fig.height = 5
+)
+
+theme_set(theme_minimal(base_size = 12))
+options(scipen = 999)
+
+format_currency <- function(x) scales::dollar(x, accuracy = 1)
+format_percent <- function(x) scales::percent(x, accuracy = 0.1)
+format_p_value <- function(x) format.pval(x, digits = 3, eps = 0.001)
+```
+
+## Introduction
+
+Healthcare data analysis helps decision makers understand patient populations, service utilization, and potential cost drivers. This report analyzes the `healthcare_prediction_dataset.csv` file to explore billing patterns, admission types, patient demographics, medical conditions, insurance providers, and length of stay.
+
+The goal is to produce a professional exploratory analysis that answers four practical questions:
+
+- What does the cleaned patient encounter dataset look like?
+- Which conditions, insurers, and admission types account for the largest patient volumes and billing differences?
+- How do age and length of stay relate to billing amount?
+- Are medical condition and admission type statistically associated?
+
+This analysis is exploratory. It identifies patterns and associations, but it should not be interpreted as a causal or clinical decision model.
+
+## 1. Data Loading and Preparation
+
+The first step is to load the dataset, standardize column names, convert dates, and create a few derived fields that make the analysis easier to interpret.
+
+```{r load-data}
+health_raw <- read_csv("healthcare_prediction_dataset.csv", show_col_types = FALSE) %>%
+  janitor::clean_names()
+
+glimpse(health_raw)
+```
+
+The dataset includes patient-level fields such as demographics, condition, admission date, discharge date, insurance provider, billing amount, medication, and test result.
+
+```{r prepare-data}
+health_prepared <- health_raw %>%
+  mutate(
+    date_of_admission = mdy(date_of_admission),
+    discharge_date = mdy(discharge_date),
+    length_of_stay = as.numeric(discharge_date - date_of_admission)
+  )
+
+health_clean <- health_prepared %>%
+  filter(
+    !is.na(age),
+    !is.na(billing_amount),
+    billing_amount > 0,
+    !is.na(date_of_admission),
+    !is.na(discharge_date),
+    length_of_stay >= 0
+  ) %>%
+  mutate(
+    across(
+      c(gender, blood_type, medical_condition, insurance_provider,
+        admission_type, medication, test_results),
+      ~ forcats::fct_infreq(as.factor(.x))
+    )
+  )
+
+removed_records <- nrow(health_prepared) - nrow(health_clean)
+
+glimpse(health_clean)
+```
+
+The cleaning step removes records with missing critical fields, invalid dates, negative length of stay, or non-positive billing amounts. In this dataset, `r scales::comma(removed_records)` records were excluded from the analytical sample.
+
+## 2. Data Quality Review
+
+A professional healthcare analysis should make the cleaning logic transparent. The table below summarizes the main quality checks before final filtering.
+
+```{r data-quality-checks}
+quality_checks <- tibble(
+  Check = c(
+    "Total source records",
+    "Missing billing amount",
+    "Non-positive billing amount",
+    "Missing or invalid admission date",
+    "Missing or invalid discharge date",
+    "Negative length of stay",
+    "Records retained for analysis"
+  ),
+  Count = c(
+    nrow(health_prepared),
+    sum(is.na(health_prepared$billing_amount)),
+    sum(health_prepared$billing_amount <= 0, na.rm = TRUE),
+    sum(is.na(health_prepared$date_of_admission)),
+    sum(is.na(health_prepared$discharge_date)),
+    sum(health_prepared$length_of_stay < 0, na.rm = TRUE),
+    nrow(health_clean)
+  )
+)
+
+knitr::kable(quality_checks, caption = "Data Quality Checks")
+```
+
+```{r missing-values}
+missing_tbl <- health_raw %>%
+  summarise(across(everything(), ~ sum(is.na(.x)))) %>%
+  pivot_longer(everything(), names_to = "Field", values_to = "Missing_Count") %>%
+  mutate(Missing_Rate = Missing_Count / nrow(health_raw)) %>%
+  arrange(desc(Missing_Count))
+
+knitr::kable(
+  missing_tbl %>%
+    mutate(Missing_Rate = format_percent(Missing_Rate)),
+  caption = "Missing Values by Field"
+)
+```
+
+For privacy-conscious reporting, the preview below excludes direct identifiers such as patient name, doctor, hospital, and room number. Even when a dataset is synthetic, a portfolio healthcare analysis should model careful handling of patient-level fields.
+
+```{r deidentified-preview}
+preview_tbl <- health_clean %>%
+  transmute(
+    Age = age,
+    Gender = gender,
+    `Blood Type` = blood_type,
+    `Medical Condition` = medical_condition,
+    `Insurance Provider` = insurance_provider,
+    `Admission Type` = admission_type,
+    `Admission Date` = date_of_admission,
+    `Length of Stay` = length_of_stay,
+    `Billing Amount` = billing_amount,
+    Medication = medication,
+    `Test Result` = test_results
+  ) %>%
+  slice_head(n = 500)
+
+DT::datatable(
+  preview_tbl,
+  caption = "De-identified Patient Encounter Preview",
+  options = list(pageLength = 10, scrollX = TRUE, autoWidth = TRUE),
+  rownames = FALSE,
+  filter = "top",
+  class = "cell-border stripe"
+) %>%
+  formatCurrency("Billing Amount", currency = "$", digits = 0) %>%
+  formatRound("Length of Stay", digits = 0)
+```
+
+## 3. Feature Engineering
+
+Feature engineering creates practical groupings that support clearer interpretation. Here, age is grouped into patient segments, length of stay is grouped into utilization bands, billing amount is split into quartile-based tiers, and admission weekday is created from the admission date.
+
+```{r feature-engineering}
+health_clean <- health_clean %>%
+  mutate(
+    age_group = cut(
+      age,
+      breaks = c(0, 17, 34, 49, 64, Inf),
+      labels = c("0-17", "18-34", "35-49", "50-64", "65+"),
+      include.lowest = TRUE
+    ),
+    length_of_stay_group = cut(
+      length_of_stay,
+      breaks = c(-Inf, 2, 7, 14, Inf),
+      labels = c("0-2 days", "3-7 days", "8-14 days", "15+ days")
+    ),
+    billing_tier = ntile(billing_amount, 4),
+    billing_tier = factor(
+      billing_tier,
+      levels = 1:4,
+      labels = c("Lowest 25%", "25-50%", "50-75%", "Highest 25%")
+    ),
+    admission_weekday = wday(date_of_admission, label = TRUE, abbr = FALSE)
+  )
+
+summary(health_clean)
+```
+
+## 4. Executive Summary Metrics
+
+The table below provides a quick profile of the cleaned analytical sample.
+
+```{r executive-summary}
+top_condition <- health_clean %>%
+  count(medical_condition, sort = TRUE) %>%
+  slice_max(n, n = 1, with_ties = FALSE)
+
+top_insurer <- health_clean %>%
+  count(insurance_provider, sort = TRUE) %>%
+  slice_max(n, n = 1, with_ties = FALSE)
+
+date_range_text <- paste(
+  format(min(health_clean$date_of_admission), "%B %d, %Y"),
+  "to",
+  format(max(health_clean$date_of_admission), "%B %d, %Y")
+)
+
+overview_metrics <- tibble(
+  Metric = c(
+    "Patient encounters analyzed",
+    "Admission date range",
+    "Median patient age",
+    "Median billing amount",
+    "Median length of stay",
+    "Most common condition",
+    "Largest insurance group"
+  ),
+  Value = c(
+    scales::comma(nrow(health_clean)),
+    date_range_text,
+    paste0(round(median(health_clean$age, na.rm = TRUE), 1), " years"),
+    format_currency(median(health_clean$billing_amount, na.rm = TRUE)),
+    paste0(round(median(health_clean$length_of_stay, na.rm = TRUE), 1), " days"),
+    paste0(as.character(top_condition$medical_condition), " (", format_percent(top_condition$n / nrow(health_clean)), ")"),
+    paste0(as.character(top_insurer$insurance_provider), " (", format_percent(top_insurer$n / nrow(health_clean)), ")")
+  )
+)
+
+knitr::kable(overview_metrics, caption = "Executive Summary Metrics")
+```
+
+The cleaned dataset contains `r scales::comma(nrow(health_clean))` patient encounters from `r date_range_text`. The most common condition is `r as.character(top_condition$medical_condition)`, and the largest insurance group is `r as.character(top_insurer$insurance_provider)`.
+
+## 5. Exploratory Data Analysis
+
+Exploratory data analysis summarizes the main distributions and group-level differences before formal testing.
+
+### 5.1 Summary by Medical Condition
+
+```{r condition-summary}
+condition_summary <- health_clean %>%
+  group_by(medical_condition) %>%
+  summarise(
+    Patients = n(),
+    Patient_Share = Patients / nrow(health_clean),
+    Median_Age = median(age, na.rm = TRUE),
+    Median_Length_of_Stay = median(length_of_stay, na.rm = TRUE),
+    Median_Billing = median(billing_amount, na.rm = TRUE),
+    Average_Billing = mean(billing_amount, na.rm = TRUE),
+    Abnormal_Test_Rate = mean(test_results == "Abnormal", na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(Patients))
+
+DT::datatable(
+  condition_summary,
+  caption = "Patient and Billing Summary by Medical Condition",
+  options = list(pageLength = 10, autoWidth = TRUE),
+  rownames = FALSE,
+  filter = "top",
+  class = "cell-border stripe"
+) %>%
+  formatPercentage(c("Patient_Share", "Abnormal_Test_Rate"), digits = 1) %>%
+  formatRound(c("Median_Age", "Median_Length_of_Stay"), digits = 1) %>%
+  formatCurrency(c("Median_Billing", "Average_Billing"), currency = "$", digits = 0)
+```
+
+This table helps identify which conditions are most common and whether those conditions differ meaningfully in age profile, stay length, billing, or abnormal test rate.
+
+### 5.2 Summary by Insurance Provider
+
+```{r insurance-summary}
+insurance_summary <- health_clean %>%
+  group_by(insurance_provider) %>%
+  summarise(
+    Patients = n(),
+    Patient_Share = Patients / nrow(health_clean),
+    Median_Billing = median(billing_amount, na.rm = TRUE),
+    Average_Billing = mean(billing_amount, na.rm = TRUE),
+    Median_Length_of_Stay = median(length_of_stay, na.rm = TRUE),
+    Emergency_Share = mean(admission_type == "Emergency", na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(Patients))
+
+DT::datatable(
+  insurance_summary,
+  caption = "Billing and Utilization Summary by Insurance Provider",
+  options = list(pageLength = 10, autoWidth = TRUE),
+  rownames = FALSE,
+  filter = "top",
+  class = "cell-border stripe"
+) %>%
+  formatPercentage(c("Patient_Share", "Emergency_Share"), digits = 1) %>%
+  formatRound("Median_Length_of_Stay", digits = 1) %>%
+  formatCurrency(c("Median_Billing", "Average_Billing"), currency = "$", digits = 0)
+```
+
+Insurance-level summaries can highlight where patient volume, emergency mix, or billing levels differ across payers.
+
+### 5.3 Admission Type and Condition Mix
+
+```{r admission-condition-table}
+admission_condition <- health_clean %>%
+  count(medical_condition, admission_type) %>%
+  group_by(medical_condition) %>%
+  mutate(Condition_Share = n / sum(n)) %>%
+  ungroup() %>%
+  pivot_wider(
+    names_from = admission_type,
+    values_from = c(n, Condition_Share),
+    values_fill = 0
+  )
+
+DT::datatable(
+  admission_condition,
+  caption = "Admissions by Medical Condition and Admission Type",
+  options = list(pageLength = 10, scrollX = TRUE, autoWidth = TRUE),
+  rownames = FALSE,
+  class = "cell-border stripe"
+)
+```
+
+This cross-tabulation shows whether each condition has a different mix of elective, urgent, and emergency admissions.
+
+## 6. Visual Analysis
+
+Interactive visualizations make it easier to explore billing variation, utilization patterns, and potential relationships among key variables.
+
+### 6.1 Billing Amount Distribution
+
+```{r billing-distribution}
+median_billing <- median(health_clean$billing_amount, na.rm = TRUE)
+
+p_billing <- ggplot(health_clean, aes(x = billing_amount)) +
+  geom_histogram(bins = 40, fill = "#2c7fb8", color = "white") +
+  geom_vline(xintercept = median_billing, color = "#d95f02", linewidth = 1) +
+  scale_x_continuous(labels = scales::dollar_format()) +
+  labs(
+    title = "Distribution of Billing Amount",
+    subtitle = paste("Median billing amount:", format_currency(median_billing)),
+    x = "Billing Amount",
+    y = "Patient Encounters"
+  )
+
+ggplotly(p_billing)
+```
+
+The distribution gives a quick view of common billing ranges and highlights whether high-cost outliers are present.
+
+### 6.2 Billing by Medical Condition
+
+```{r billing-by-condition}
+p_condition_billing <- health_clean %>%
+  mutate(medical_condition = forcats::fct_reorder(medical_condition, billing_amount, .fun = median)) %>%
+  ggplot(
+    aes(
+      x = medical_condition,
+      y = billing_amount,
+      fill = medical_condition,
+      text = paste(
+        "Condition:", medical_condition,
+        "<br>Billing:", format_currency(billing_amount),
+        "<br>Admission:", admission_type,
+        "<br>Length of stay:", length_of_stay, "days"
+      )
+    )
+  ) +
+  geom_boxplot(outlier.alpha = 0.18) +
+  coord_flip() +
+  scale_y_continuous(labels = scales::dollar_format()) +
+  guides(fill = "none") +
+  labs(
+    title = "Billing Amount by Medical Condition",
+    x = "Medical Condition",
+    y = "Billing Amount"
+  )
+
+ggplotly(p_condition_billing, tooltip = "text")
+```
+
+Box plots compare median billing and spread by condition, making it easier to spot categories with more variable or higher-cost encounters.
+
+### 6.3 Admission Type Mix by Medical Condition
+
+```{r admission-mix-plot}
+admission_mix <- health_clean %>%
+  count(medical_condition, admission_type) %>%
+  group_by(medical_condition) %>%
+  mutate(Patient_Share = n / sum(n)) %>%
+  ungroup()
+
+p_admission_mix <- admission_mix %>%
+  mutate(medical_condition = forcats::fct_reorder(medical_condition, n, .fun = sum)) %>%
+  ggplot(
+    aes(
+      x = medical_condition,
+      y = Patient_Share,
+      fill = admission_type,
+      text = paste(
+        "Condition:", medical_condition,
+        "<br>Admission type:", admission_type,
+        "<br>Patients:", scales::comma(n),
+        "<br>Share:", format_percent(Patient_Share)
+      )
+    )
+  ) +
+  geom_col(position = "fill") +
+  coord_flip() +
+  scale_y_continuous(labels = scales::percent_format()) +
+  labs(
+    title = "Admission Type Mix by Medical Condition",
+    x = "Medical Condition",
+    y = "Share of Admissions",
+    fill = "Admission Type"
+  )
+
+ggplotly(p_admission_mix, tooltip = "text")
+```
+
+This chart shows whether conditions have similar admission profiles or whether some are more concentrated in emergency, urgent, or elective encounters.
+
+### 6.4 Billing by Age and Admission Type
+
+```{r age-billing-plot}
+set.seed(123)
+plot_sample <- health_clean %>%
+  slice_sample(n = min(5000, nrow(health_clean)))
+
+p_age_billing <- ggplot(plot_sample, aes(x = age, y = billing_amount, color = admission_type)) +
+  geom_point(
+    aes(
+      text = paste(
+        "Age:", age,
+        "<br>Billing:", format_currency(billing_amount),
+        "<br>Condition:", medical_condition,
+        "<br>Admission:", admission_type
+      )
+    ),
+    alpha = 0.35
+  ) +
+  geom_smooth(method = "lm", se = FALSE, linewidth = 0.8) +
+  scale_y_continuous(labels = scales::dollar_format()) +
+  labs(
+    title = "Billing Amount by Age and Admission Type",
+    subtitle = "A sampled view keeps the interactive chart responsive",
+    x = "Age",
+    y = "Billing Amount",
+    color = "Admission Type"
+  )
+
+ggplotly(p_age_billing, tooltip = "text")
+```
+
+The sampled scatter plot provides a readable view of whether age is visibly related to billing and whether that relationship differs by admission type.
+
+### 6.5 Length of Stay and Billing
+
+```{r length-of-stay-billing}
+p_los_billing <- ggplot(plot_sample, aes(x = length_of_stay, y = billing_amount, color = admission_type)) +
+  geom_point(
+    aes(
+      text = paste(
+        "Length of stay:", length_of_stay, "days",
+        "<br>Billing:", format_currency(billing_amount),
+        "<br>Condition:", medical_condition,
+        "<br>Admission:", admission_type
+      )
+    ),
+    alpha = 0.35
+  ) +
+  geom_smooth(method = "lm", se = FALSE, linewidth = 0.8) +
+  scale_y_continuous(labels = scales::dollar_format()) +
+  labs(
+    title = "Billing Amount by Length of Stay",
+    x = "Length of Stay (days)",
+    y = "Billing Amount",
+    color = "Admission Type"
+  )
+
+ggplotly(p_los_billing, tooltip = "text")
+```
+
+Length of stay is a practical utilization measure. If longer stays are associated with higher billing, that can motivate deeper review of care pathways, discharge planning, and case complexity.
+
+### 6.6 Admissions by Day of Week
+
+```{r weekday-admissions}
+weekday_admissions <- health_clean %>%
+  count(admission_weekday)
+
+p_weekday <- weekday_admissions %>%
+  ggplot(aes(x = admission_weekday, y = n, text = paste("Admissions:", scales::comma(n)))) +
+  geom_col(fill = "#4daf4a") +
+  labs(
+    title = "Hospital Admissions by Day of Week",
+    x = "Admission Weekday",
+    y = "Patient Encounters"
+  )
+
+ggplotly(p_weekday, tooltip = "text")
+```
+
+Weekday patterns can help operations teams understand whether patient volume is evenly distributed or concentrated around certain days.
+
+## 7. Statistical Analysis
+
+The statistical tests below add structure to the exploratory findings. Because the dataset is observational, results should be interpreted as associations rather than causal effects.
+
+### 7.1 Chi-Square Test: Medical Condition vs. Admission Type
+
+```{r chi-square-test}
+condition_admission_tab <- table(health_clean$medical_condition, health_clean$admission_type)
+chi_condition_admission <- chisq.test(condition_admission_tab)
+
+chi_summary <- tibble(
+  Test = "Chi-square test of independence",
+  Statistic = round(unname(chi_condition_admission$statistic), 2),
+  Degrees_of_Freedom = unname(chi_condition_admission$parameter),
+  P_Value = format_p_value(chi_condition_admission$p.value)
+)
+
+knitr::kable(chi_summary, caption = "Association Between Medical Condition and Admission Type")
+```
+
+This test evaluates whether admission type is independent of medical condition. A small p-value suggests that admission type mix differs by condition.
+
+### 7.2 Correlation: Age and Billing Amount
+
+```{r age-billing-correlation}
+age_billing_cor <- cor.test(
+  health_clean$age,
+  health_clean$billing_amount,
+  use = "complete.obs"
+)
+
+cor_summary <- tibble(
+  Metric = c("Correlation coefficient", "P-value"),
+  Value = c(
+    round(unname(age_billing_cor$estimate), 3),
+    format_p_value(age_billing_cor$p.value)
+  )
+)
+
+knitr::kable(cor_summary, caption = "Correlation Between Age and Billing Amount")
+```
+
+The correlation coefficient describes the strength and direction of the relationship between patient age and billing amount.
+
+### 7.3 Multivariable Billing Model
+
+```{r billing-regression}
+billing_model <- lm(
+  billing_amount ~ age + length_of_stay + admission_type +
+    medical_condition + insurance_provider,
+  data = health_clean
+)
+
+model_fit <- summary(billing_model)
+model_f <- model_fit$fstatistic
+model_p <- pf(model_f[1], model_f[2], model_f[3], lower.tail = FALSE)
+
+model_summary <- tibble(
+  Metric = c("R-squared", "Adjusted R-squared", "Overall model p-value"),
+  Value = c(
+    round(model_fit$r.squared, 3),
+    round(model_fit$adj.r.squared, 3),
+    format_p_value(model_p)
+  )
+)
+
+knitr::kable(model_summary, caption = "Billing Model Fit Summary")
+```
+
+```{r billing-regression-coefficients}
+model_coefficients <- as.data.frame(coef(summary(billing_model))) %>%
+  tibble::rownames_to_column("Term") %>%
+  rename(
+    Estimate = Estimate,
+    Std_Error = `Std. Error`,
+    Statistic = `t value`,
+    P_Value = `Pr(>|t|)`
+  ) %>%
+  filter(Term != "(Intercept)") %>%
+  mutate(Absolute_Estimate = abs(Estimate)) %>%
+  arrange(desc(Absolute_Estimate)) %>%
+  slice_head(n = 10) %>%
+  select(Term, Estimate, Std_Error, Statistic, P_Value)
+
+DT::datatable(
+  model_coefficients,
+  caption = "Largest Billing Model Coefficients by Absolute Estimate",
+  options = list(pageLength = 10, autoWidth = TRUE),
+  rownames = FALSE,
+  class = "cell-border stripe"
+) %>%
+  formatCurrency(c("Estimate", "Std_Error"), currency = "$", digits = 0) %>%
+  formatRound("Statistic", digits = 2) %>%
+  formatSignif("P_Value", digits = 3)
+```
+
+The regression model provides a directional view of billing associations after controlling for age, length of stay, admission type, medical condition, and insurance provider. It should be used as an exploratory diagnostic rather than a final predictive model.
+
+## 8. Conclusion and Recommendations
+
+This report cleaned and structured the healthcare dataset, removed non-positive billing records, created utilization-focused features, and analyzed billing variation across conditions, insurance providers, admission types, patient age, and length of stay. The updated workflow is designed to be reproducible, privacy-aware, and easier to present in a professional portfolio.
+
+Key recommendations:
+
+- Use condition and insurance summaries to identify groups with the highest median billing and largest patient volumes.
+- Review admission type mix by condition to understand whether certain diagnoses are more concentrated in emergency, urgent, or elective encounters.
+- Treat age, length of stay, and admission type as starting points for deeper cost-driver analysis, not as causal explanations.
+- Keep public-facing outputs de-identified by excluding direct patient, provider, room, and facility identifiers from preview tables.
+
+Future work could extend this project with predictive modeling, train/test validation, feature importance, and a dashboard-style summary for hospital operations or insurance analytics.

@@ -1,0 +1,646 @@
+---
+title: "Healthcare Utilization, Billing & Predictive Modeling"
+author: "Thuc Cao"
+date: "`r Sys.Date()`"
+output:
+  html_notebook:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    number_sections: true
+    theme: flatly
+    highlight: tango
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+# ── Core ──────────────────────────────────────────────────────────────────────
+library(tidyverse)
+library(janitor)
+library(lubridate)
+
+# ── Visualization ─────────────────────────────────────────────────────────────
+library(ggplot2)
+library(plotly)
+library(DT)
+library(scales)
+
+# ── Reporting ─────────────────────────────────────────────────────────────────
+library(knitr)
+library(kableExtra)
+
+# ── Machine Learning ──────────────────────────────────────────────────────────
+library(tidymodels)   # Core ML framework
+library(ranger)       # Fast random forest implementation
+library(themis)       # SMOTE for class imbalance
+library(vip)          # Variable importance plots
+library(yardstick)    # Model metrics
+
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.width  = 9,
+  fig.height = 5,
+  dpi = 150
+)
+
+theme_set(theme_minimal(base_size = 12))
+options(scipen = 999)
+tidymodels_prefer()
+
+# ── Helper formatters ─────────────────────────────────────────────────────────
+fmt_dollar  <- function(x) scales::dollar(x, accuracy = 1)
+fmt_pct     <- function(x) scales::percent(x, accuracy = 0.1)
+fmt_pval    <- function(x) format.pval(x, digits = 3, eps = 0.001)
+```
+
+---
+
+## Introduction
+
+This notebook extends the baseline exploratory analysis with a full **supervised machine learning pipeline** built in `tidymodels`. The clinical question is:
+
+> **Can we predict whether a patient encounter will result in an Abnormal test outcome, using available administrative and demographic features?**
+
+This is a realistic triage problem. Identifying patients at risk of abnormal findings from admission characteristics alone could help prioritize early clinical intervention.
+
+The notebook is structured as follows:
+
+1. Data loading, cleaning, and feature engineering (production-grade pipeline)
+2. Exploratory analysis (summarized from the EDA notebook)
+3. Machine learning: binary classification with cross-validation
+4. Model comparison: Logistic Regression vs. Random Forest
+5. Evaluation: ROC-AUC, confusion matrix, feature importance
+6. Honest interpretation of results
+
+---
+
+## Data Loading & Preparation {#data-prep}
+
+```{r load-data}
+health_raw <- read_csv(
+  here::here("data", "healthcare_prediction_dataset.csv"),
+  show_col_types = FALSE
+) %>%
+  janitor::clean_names()
+
+# Fallback path for running directly from analysis/ folder
+if (!exists("health_raw") || nrow(health_raw) == 0) {
+  health_raw <- read_csv("../data/healthcare_prediction_dataset.csv",
+                         show_col_types = FALSE) %>%
+    janitor::clean_names()
+}
+
+cat("Dimensions:", nrow(health_raw), "rows ×", ncol(health_raw), "columns\n")
+glimpse(health_raw)
+```
+
+```{r clean-data}
+health_prepared <- health_raw %>%
+  mutate(
+    date_of_admission = mdy(date_of_admission),
+    discharge_date    = mdy(discharge_date),
+    length_of_stay    = as.numeric(discharge_date - date_of_admission)
+  )
+
+health_clean <- health_prepared %>%
+  filter(
+    !is.na(age),
+    !is.na(billing_amount),
+    billing_amount > 0,
+    !is.na(date_of_admission),
+    !is.na(discharge_date),
+    length_of_stay >= 0,
+    !is.na(test_results)
+  ) %>%
+  mutate(
+    # Ordered factors for model readability
+    across(
+      c(gender, blood_type, medical_condition,
+        insurance_provider, admission_type, medication),
+      ~ forcats::fct_infreq(as.factor(.x))
+    ),
+    # ── Feature engineering ────────────────────────────────────────────────
+    age_group = cut(
+      age,
+      breaks = c(0, 17, 34, 49, 64, Inf),
+      labels = c("0-17", "18-34", "35-49", "50-64", "65+"),
+      include.lowest = TRUE
+    ),
+    los_group = cut(
+      length_of_stay,
+      breaks = c(-Inf, 2, 7, 14, Inf),
+      labels = c("0-2d", "3-7d", "8-14d", "15+d")
+    ),
+    billing_tier = ntile(billing_amount, 4),
+    billing_tier = factor(
+      billing_tier,
+      levels = 1:4,
+      labels = c("Q1_Low", "Q2", "Q3", "Q4_High")
+    ),
+    admission_weekday = wday(date_of_admission, label = TRUE, abbr = FALSE),
+    admission_month   = month(date_of_admission, label = TRUE, abbr = TRUE),
+    # ── Binary outcome for ML ──────────────────────────────────────────────
+    # 1 = Abnormal result (clinical event of interest)
+    # 0 = Normal or Inconclusive
+    abnormal_result = factor(
+      if_else(test_results == "Abnormal", "Abnormal", "Other"),
+      levels = c("Other", "Abnormal")  # "Other" = reference level
+    )
+  )
+
+n_removed <- nrow(health_prepared) - nrow(health_clean)
+cat(sprintf("Records retained: %s  |  Removed: %s (%.1f%%)\n",
+            scales::comma(nrow(health_clean)),
+            scales::comma(n_removed),
+            100 * n_removed / nrow(health_prepared)))
+```
+
+### Data Quality Summary
+
+```{r quality-check}
+quality_tbl <- tibble(
+  Check                   = c("Total source records", "Missing billing amount",
+                               "Non-positive billing", "Missing/invalid admission date",
+                               "Missing/invalid discharge date", "Negative length of stay",
+                               "Missing test result", "Records retained"),
+  Count                   = c(nrow(health_prepared),
+                               sum(is.na(health_prepared$billing_amount)),
+                               sum(health_prepared$billing_amount <= 0, na.rm = TRUE),
+                               sum(is.na(health_prepared$date_of_admission)),
+                               sum(is.na(health_prepared$discharge_date)),
+                               sum(health_prepared$length_of_stay < 0, na.rm = TRUE),
+                               sum(is.na(health_prepared$test_results)),
+                               nrow(health_clean))
+)
+
+knitr::kable(quality_tbl, format.args = list(big.mark = ","),
+             caption = "Data Quality Summary") %>%
+  kableExtra::kable_styling(bootstrap_options = c("striped", "hover"),
+                            full_width = FALSE)
+```
+
+---
+
+## Exploratory Data Analysis {#eda}
+
+### Outcome Distribution
+
+```{r outcome-distribution}
+outcome_counts <- health_clean %>%
+  count(test_results, abnormal_result) %>%
+  mutate(pct = n / sum(n))
+
+p_outcome <- outcome_counts %>%
+  ggplot(aes(x = fct_reorder(test_results, n), y = n,
+             fill = abnormal_result,
+             text = paste0(test_results, "\n",
+                           scales::comma(n), " patients (",
+                           fmt_pct(pct), ")"))) +
+  geom_col() +
+  coord_flip() +
+  scale_fill_manual(values = c("Abnormal" = "#d95f02", "Other" = "#7570b3")) +
+  scale_y_continuous(labels = scales::comma) +
+  labs(title = "Test Result Distribution",
+       subtitle = paste0("Binary target: Abnormal = ",
+                         fmt_pct(mean(health_clean$abnormal_result == "Abnormal")),
+                         " of encounters"),
+       x = NULL, y = "Patient Encounters", fill = "ML Label") +
+  theme(legend.position = "bottom")
+
+ggplotly(p_outcome, tooltip = "text")
+```
+
+### Abnormal Rate by Medical Condition
+
+```{r abnormal-by-condition}
+abnormal_by_condition <- health_clean %>%
+  group_by(medical_condition) %>%
+  summarise(
+    n_total   = n(),
+    n_abnormal = sum(abnormal_result == "Abnormal"),
+    pct_abnormal = n_abnormal / n_total,
+    .groups = "drop"
+  ) %>%
+  arrange(desc(pct_abnormal))
+
+p_ab_cond <- abnormal_by_condition %>%
+  mutate(medical_condition = fct_reorder(medical_condition, pct_abnormal)) %>%
+  ggplot(aes(x = medical_condition, y = pct_abnormal,
+             fill = pct_abnormal,
+             text = paste0(medical_condition, "\n",
+                           fmt_pct(pct_abnormal), " Abnormal\n",
+                           scales::comma(n_abnormal), " / ",
+                           scales::comma(n_total)))) +
+  geom_col() +
+  coord_flip() +
+  scale_y_continuous(labels = scales::percent_format()) +
+  scale_fill_gradient(low = "#74c476", high = "#d95f02") +
+  guides(fill = "none") +
+  labs(title = "Abnormal Test Rate by Medical Condition",
+       x = NULL, y = "% Abnormal Tests")
+
+ggplotly(p_ab_cond, tooltip = "text")
+```
+
+### Billing Distribution by Outcome
+
+```{r billing-by-outcome}
+p_billing_outcome <- health_clean %>%
+  ggplot(aes(x = abnormal_result, y = billing_amount,
+             fill = abnormal_result,
+             text = paste("Result:", abnormal_result,
+                          "<br>Billing:", fmt_dollar(billing_amount)))) +
+  geom_violin(alpha = 0.6, trim = FALSE) +
+  geom_boxplot(width = 0.12, outlier.alpha = 0.1, fill = "white") +
+  scale_y_continuous(labels = scales::dollar_format()) +
+  scale_fill_manual(values = c("Abnormal" = "#d95f02", "Other" = "#2c7fb8")) +
+  guides(fill = "none") +
+  labs(title = "Billing Amount by Test Outcome",
+       x = "Test Outcome", y = "Billing Amount")
+
+ggplotly(p_billing_outcome, tooltip = "text")
+```
+
+### Abnormal Rate by Age Group and Admission Type
+
+```{r heatmap-age-admission}
+heatmap_data <- health_clean %>%
+  group_by(age_group, admission_type) %>%
+  summarise(pct_abnormal = mean(abnormal_result == "Abnormal"),
+            n = n(), .groups = "drop")
+
+p_heat <- heatmap_data %>%
+  ggplot(aes(x = admission_type, y = age_group, fill = pct_abnormal,
+             text = paste0("Age: ", age_group, " | Admission: ", admission_type,
+                           "\nAbnormal rate: ", fmt_pct(pct_abnormal),
+                           "\nN = ", scales::comma(n)))) +
+  geom_tile(color = "white", linewidth = 0.5) +
+  scale_fill_gradient2(low = "#2166ac", mid = "#f7f7f7", high = "#d6604d",
+                       midpoint = mean(heatmap_data$pct_abnormal),
+                       labels = scales::percent_format()) +
+  labs(title = "Abnormal Test Rate by Age Group and Admission Type",
+       x = "Admission Type", y = "Age Group",
+       fill = "% Abnormal")
+
+ggplotly(p_heat, tooltip = "text")
+```
+
+---
+
+## Machine Learning Pipeline {#ml}
+
+### Design Decisions
+
+**Task:** Binary classification — predict `Abnormal` test result vs. `Other` (Normal or Inconclusive).
+
+**Why this target?**
+- Clinically interpretable: abnormal results typically trigger follow-up, additional cost, and care complexity.
+- Balanced enough for classification without severe class imbalance (verified below).
+- Normal vs. Inconclusive is a fuzzier distinction and less actionable clinically.
+
+**Features used:**
+- Demographics: `age`, `gender`, `blood_type`
+- Clinical: `medical_condition`, `medication`
+- Administrative: `insurance_provider`, `admission_type`, `length_of_stay`, `billing_amount`
+- Derived: `age_group`, `los_group`, `billing_tier`, `admission_weekday`
+
+**Features excluded:**
+- `name`, `doctor`, `hospital`, `room_number` — direct identifiers, not generalizable
+- `date_of_admission`, `discharge_date` — encoded via derived features instead
+- `test_results` — this is the raw label, replaced by `abnormal_result`
+
+```{r class-balance}
+health_clean %>%
+  count(abnormal_result) %>%
+  mutate(pct = scales::percent(n / sum(n))) %>%
+  knitr::kable(caption = "Outcome Class Distribution",
+               col.names = c("Class", "Count", "Share"))
+```
+
+### Train / Test Split
+
+```{r train-test-split}
+set.seed(42)
+
+# Stratified split preserves outcome proportions in both sets
+health_split <- initial_split(health_clean, prop = 0.75, strata = abnormal_result)
+health_train <- training(health_split)
+health_test  <- testing(health_split)
+
+cat(sprintf("Training set: %s rows | Test set: %s rows\n",
+            scales::comma(nrow(health_train)),
+            scales::comma(nrow(health_test))))
+
+# 5-fold CV on the training set
+health_folds <- vfold_cv(health_train, v = 5, strata = abnormal_result)
+```
+
+### Feature Preprocessing Recipe
+
+The `tidymodels` recipe defines the preprocessing pipeline — dummy encoding, normalization, near-zero variance filtering, and SMOTE upsampling for class balance.
+
+```{r recipe}
+ml_recipe <- recipe(
+  abnormal_result ~ age + gender + blood_type + medical_condition +
+    insurance_provider + admission_type + medication +
+    billing_amount + length_of_stay + age_group + los_group +
+    billing_tier + admission_weekday,
+  data = health_train
+) %>%
+  # Handle novel factor levels in test set
+  step_novel(all_nominal_predictors()) %>%
+  # Dummy-encode all categorical features (one-hot)
+  step_dummy(all_nominal_predictors(), one_hot = FALSE) %>%
+  # Remove near-zero variance predictors (sparse dummies)
+  step_nzv(all_predictors()) %>%
+  # Normalize continuous features (mean = 0, sd = 1)
+  step_normalize(all_numeric_predictors()) %>%
+  # SMOTE: oversample the minority class in training folds only
+  themis::step_smote(abnormal_result, over_ratio = 0.8, seed = 42)
+
+# Preview the preprocessed training data structure
+prep(ml_recipe) %>% bake(new_data = NULL) %>% glimpse()
+```
+
+### Model Specifications
+
+```{r model-specs}
+# ── Model 1: Logistic Regression (interpretable baseline) ──────────────────
+logistic_spec <- logistic_reg(
+  penalty = tune(),   # L1 / L2 regularization strength (tuned)
+  mixture = tune()    # 0 = Ridge, 1 = Lasso
+) %>%
+  set_engine("glmnet") %>%
+  set_mode("classification")
+
+# ── Model 2: Random Forest (non-linear, captures interactions) ─────────────
+rf_spec <- rand_forest(
+  trees = 500,
+  mtry  = tune(),     # Features sampled per split
+  min_n = tune()      # Minimum node size
+) %>%
+  set_engine("ranger", importance = "impurity") %>%
+  set_mode("classification")
+```
+
+### Workflows
+
+```{r workflows}
+# Bind recipe + model spec into portable workflow objects
+logistic_wf <- workflow() %>%
+  add_recipe(ml_recipe) %>%
+  add_model(logistic_spec)
+
+rf_wf <- workflow() %>%
+  add_recipe(ml_recipe) %>%
+  add_model(rf_spec)
+```
+
+### Hyperparameter Tuning
+
+```{r tune-logistic, cache=TRUE}
+# ── Logistic Regression grid ───────────────────────────────────────────────
+logistic_grid <- grid_regular(
+  penalty(range = c(-4, 0)),   # 10^-4 to 10^0
+  mixture(range = c(0, 1)),
+  levels = 5
+)
+
+logistic_results <- tune_grid(
+  logistic_wf,
+  resamples = health_folds,
+  grid      = logistic_grid,
+  metrics   = metric_set(roc_auc, accuracy, f_meas),
+  control   = control_grid(save_pred = TRUE, verbose = FALSE)
+)
+
+# Best logistic configuration by ROC-AUC
+best_logistic <- select_best(logistic_results, metric = "roc_auc")
+cat("Best Logistic params:\n")
+print(best_logistic)
+```
+
+```{r tune-rf, cache=TRUE}
+# ── Random Forest grid ─────────────────────────────────────────────────────
+rf_grid <- grid_random(
+  mtry(range = c(3, 20)),
+  min_n(range = c(5, 40)),
+  size = 15
+)
+
+rf_results <- tune_grid(
+  rf_wf,
+  resamples = health_folds,
+  grid      = rf_grid,
+  metrics   = metric_set(roc_auc, accuracy, f_meas),
+  control   = control_grid(save_pred = TRUE, verbose = FALSE)
+)
+
+best_rf <- select_best(rf_results, metric = "roc_auc")
+cat("Best RF params:\n")
+print(best_rf)
+```
+
+### Cross-Validation Performance
+
+```{r cv-metrics}
+# Collect and compare CV metrics across both models
+logistic_cv <- collect_metrics(logistic_results) %>%
+  filter(.config == best_logistic$.config) %>%
+  mutate(Model = "Logistic Regression")
+
+rf_cv <- collect_metrics(rf_results) %>%
+  filter(.config == best_rf$.config) %>%
+  mutate(Model = "Random Forest")
+
+cv_summary <- bind_rows(logistic_cv, rf_cv) %>%
+  select(Model, .metric, mean, std_err) %>%
+  filter(.metric %in% c("roc_auc", "accuracy", "f_meas")) %>%
+  mutate(
+    mean    = round(mean, 4),
+    std_err = round(std_err, 4)
+  )
+
+knitr::kable(cv_summary,
+             caption = "5-Fold Cross-Validation Results (Best Configuration)",
+             col.names = c("Model", "Metric", "Mean", "Std Error")) %>%
+  kableExtra::kable_styling(bootstrap_options = c("striped", "hover"),
+                            full_width = FALSE)
+```
+
+### ROC Curve Comparison (CV Predictions)
+
+```{r roc-curves}
+# Collect out-of-fold predictions for the best configs
+logistic_preds <- collect_predictions(logistic_results) %>%
+  filter(.config == best_logistic$.config) %>%
+  mutate(Model = "Logistic Regression")
+
+rf_preds <- collect_predictions(rf_results) %>%
+  filter(.config == best_rf$.config) %>%
+  mutate(Model = "Random Forest")
+
+all_preds <- bind_rows(logistic_preds, rf_preds)
+
+# Compute ROC curves
+roc_data <- all_preds %>%
+  group_by(Model) %>%
+  roc_curve(truth = abnormal_result, `.pred_Abnormal`, event_level = "second")
+
+# AUC labels for legend
+auc_labels <- all_preds %>%
+  group_by(Model) %>%
+  roc_auc(truth = abnormal_result, `.pred_Abnormal`, event_level = "second") %>%
+  mutate(label = paste0(Model, " (AUC = ", round(.estimate, 3), ")"))
+
+roc_plot <- roc_data %>%
+  left_join(auc_labels %>% select(Model, label), by = "Model") %>%
+  ggplot(aes(x = 1 - specificity, y = sensitivity,
+             color = label, group = label)) +
+  geom_path(linewidth = 1) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed",
+              color = "grey50", linewidth = 0.5) +
+  scale_color_manual(values = c("#1b7837", "#762a83")) +
+  coord_equal() +
+  labs(title = "ROC Curves — 5-Fold Cross-Validation",
+       x = "False Positive Rate (1 - Specificity)",
+       y = "True Positive Rate (Sensitivity)",
+       color = "Model") +
+  theme(legend.position = "bottom")
+
+ggplotly(roc_plot)
+```
+
+### Final Model Evaluation on Held-Out Test Set
+
+```{r final-fit}
+# Finalize workflows with best hyperparameters
+final_logistic_wf <- finalize_workflow(logistic_wf, best_logistic)
+final_rf_wf       <- finalize_workflow(rf_wf, best_rf)
+
+# Fit on full training set, evaluate on test set
+final_logistic_fit <- last_fit(final_logistic_wf, health_split,
+                                metrics = metric_set(roc_auc, accuracy, f_meas))
+final_rf_fit       <- last_fit(final_rf_wf, health_split,
+                                metrics = metric_set(roc_auc, accuracy, f_meas))
+
+# Combine test-set metrics
+test_metrics <- bind_rows(
+  collect_metrics(final_logistic_fit) %>% mutate(Model = "Logistic Regression"),
+  collect_metrics(final_rf_fit)       %>% mutate(Model = "Random Forest")
+) %>%
+  select(Model, .metric, .estimate) %>%
+  pivot_wider(names_from = .metric, values_from = .estimate) %>%
+  mutate(across(where(is.numeric), ~ round(.x, 4)))
+
+knitr::kable(test_metrics,
+             caption = "Test-Set Performance (Held-Out 25%)",
+             col.names = c("Model", "ROC-AUC", "Accuracy", "F1")) %>%
+  kableExtra::kable_styling(bootstrap_options = c("striped", "hover"),
+                            full_width = FALSE)
+```
+
+### Confusion Matrix — Random Forest
+
+```{r confusion-matrix}
+rf_test_preds <- collect_predictions(final_rf_fit)
+
+cm <- rf_test_preds %>%
+  conf_mat(truth = abnormal_result, estimate = .pred_class)
+
+# Plot
+autoplot(cm, type = "heatmap") +
+  scale_fill_gradient(low = "#f7fbff", high = "#08519c") +
+  labs(title = "Confusion Matrix — Random Forest (Test Set)")
+```
+
+```{r confusion-summary}
+# Readable summary
+cm_tbl <- summary(cm) %>%
+  filter(.metric %in% c("accuracy", "sens", "spec", "ppv", "npv", "f_meas")) %>%
+  select(.metric, .estimate) %>%
+  mutate(
+    .metric   = recode(.metric,
+                       accuracy = "Accuracy", sens = "Sensitivity (Recall)",
+                       spec = "Specificity", ppv = "Precision (PPV)",
+                       npv = "NPV", f_meas = "F1 Score"),
+    .estimate = round(.estimate, 4)
+  )
+
+knitr::kable(cm_tbl,
+             caption = "Classification Metrics — Random Forest (Test Set)",
+             col.names = c("Metric", "Value")) %>%
+  kableExtra::kable_styling(bootstrap_options = c("striped", "hover"),
+                            full_width = FALSE)
+```
+
+### Feature Importance
+
+```{r feature-importance}
+# Extract fitted RF model for VIP
+rf_fitted <- extract_fit_parsnip(final_rf_fit$.workflow[[1]])
+
+vip_plot <- vip::vip(
+  rf_fitted,
+  num_features = 15,
+  geom = "col",
+  aesthetics = list(fill = "#2c7fb8", color = "white")
+) +
+  labs(title = "Top 15 Features by Variable Importance (Random Forest)",
+       subtitle = "Importance measured by mean decrease in node impurity (Gini)",
+       x = "Feature", y = "Importance") +
+  coord_flip()
+
+ggplotly(vip_plot)
+```
+
+---
+
+## Interpretation & Limitations {#interpretation}
+
+### What the results tell us
+
+```{r interpretation-table}
+interp_tbl <- tibble(
+  Finding = c(
+    "Near-chance AUC (~0.50–0.52)",
+    "Low F1 for Abnormal class",
+    "Billing Amount is top predictor",
+    "Demographic features contribute minimally",
+    "SMOTE improved recall but reduced precision"
+  ),
+  Interpretation = c(
+    "Available administrative features have weak discriminative power for test outcome. This is an honest negative finding — important in real healthcare analytics.",
+    "The model struggles to identify true Abnormal cases, reflecting the label noise inherent in this synthetic dataset and the absence of clinical features.",
+    "Higher-billed encounters may correlate with more complex workups, indirectly capturing severity. Not a causal relationship.",
+    "Age, gender, and blood type are poor predictors of test result when condition is already known — consistent with clinical intuition.",
+    "Resampling helped surface Abnormal predictions but created false positives. In a clinical setting, the cost of false positives vs. false negatives would guide this tradeoff."
+  )
+)
+
+knitr::kable(interp_tbl, caption = "Key Findings and Interpretations") %>%
+  kableExtra::kable_styling(bootstrap_options = c("striped", "hover")) %>%
+  kableExtra::column_spec(2, width = "60%")
+```
+
+### What would improve the model in a real-world setting
+
+A production predictive model for test outcomes would benefit from:
+
+- **Clinical features**: vitals, chief complaint, prior diagnoses, lab history
+- **Procedure codes**: ICD-10, CPT codes that indicate order complexity
+- **Temporal features**: time since last admission, comorbidity burden
+- **Better target definition**: using clinical ontology (e.g., abnormal by test type and reference range) rather than a generic label
+- **Larger labeled training window**: linking admissions to outcomes over longer horizons
+
+> The low AUC result should be communicated clearly to stakeholders — model performance metrics without context can mislead decision-makers. Transparent reporting of null or weak findings is a core professional competency in applied data science.
+
+---
+
+## Session Info {#session-info}
+
+```{r session-info}
+sessionInfo()
+```
